@@ -1,12 +1,14 @@
-"""REST API backend for the Web UI."""
+"""REST API backend for the Web UI — all phases."""
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
-from starlette.routing import Route, Router
+from starlette.responses import HTMLResponse, JSONResponse, FileResponse
+from starlette.routing import Route, Router, Mount
+from starlette.staticfiles import StaticFiles
 
 from mesh.network.registry import get_registry
 from mesh.orchestrator.intent import IntentQueue
@@ -16,6 +18,16 @@ logger = logging.getLogger(__name__)
 # Module-level references set during server setup
 _intent_queue: IntentQueue | None = None
 _orchestrator = None
+_role_manager = None
+_channel_manager = None
+_mcp_registry = None
+_memory_store = None
+_knowledge_base = None
+_project_manager = None
+_tunnel_manager = None
+_activity_log: list[dict] = []
+
+MAX_ACTIVITY = 200
 
 
 def set_orchestrator(orchestrator):
@@ -25,12 +37,69 @@ def set_orchestrator(orchestrator):
         _intent_queue = orchestrator.intent_queue
 
 
+def set_role_manager(role_manager):
+    global _role_manager
+    _role_manager = role_manager
+
+
+def set_channel_manager(channel_manager):
+    global _channel_manager
+    _channel_manager = channel_manager
+
+
+def set_mcp_registry(mcp_registry):
+    global _mcp_registry
+    _mcp_registry = mcp_registry
+
+
+def set_memory_store(memory_store):
+    global _memory_store
+    _memory_store = memory_store
+
+
+def set_knowledge_base(knowledge_base):
+    global _knowledge_base
+    _knowledge_base = knowledge_base
+
+
+def set_project_manager(project_manager):
+    global _project_manager
+    _project_manager = project_manager
+
+
+def set_tunnel_manager(tunnel_manager):
+    global _tunnel_manager
+    _tunnel_manager = tunnel_manager
+
+
+def log_activity(event_type: str, detail: str, agent: str = ""):
+    from datetime import datetime, timezone
+    entry = {
+        "type": event_type,
+        "detail": detail,
+        "agent": agent,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _activity_log.append(entry)
+    if len(_activity_log) > MAX_ACTIVITY:
+        _activity_log.pop(0)
+
+
 # ---- Dashboard ----
 
 
-async def handle_dashboard(request: Request) -> HTMLResponse:
-    """GET / — Serve the dashboard HTML (single-page app shell)."""
-    return HTMLResponse(DASHBOARD_HTML)
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+async def handle_dashboard(request: Request) -> HTMLResponse | FileResponse:
+    """GET / — Serve the dashboard."""
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
+    return HTMLResponse("<h1>A2A Mesh</h1><p>Dashboard static files not found.</p>")
+
+
+# ---- Cluster Status ----
 
 
 async def handle_cluster_status(request: Request) -> JSONResponse:
@@ -60,6 +129,65 @@ async def handle_agent_detail(request: Request) -> JSONResponse:
     return JSONResponse(agent.to_dict())
 
 
+# ---- Workers (Phase 2) ----
+
+
+async def handle_workers(request: Request) -> JSONResponse:
+    """GET /api/workers — List workers with hardware info."""
+    registry = get_registry()
+    agents = registry.get_all_agents()
+    workers = [a for a in agents if a.role == "slave"]
+    return JSONResponse([a.to_dict() for a in workers])
+
+
+async def handle_assign_worker(request: Request) -> JSONResponse:
+    """POST /api/workers/{id}/assign — Assign role and model to a worker."""
+    worker_id = request.path_params["id"]
+    body = await request.json()
+    role_id = body.get("role_id", "")
+    model = body.get("model", "")
+
+    if not role_id:
+        return JSONResponse({"error": "role_id required"}, status_code=400)
+
+    registry = get_registry()
+    agent = registry.get_agent(worker_id)
+    if not agent:
+        return JSONResponse({"error": "Worker not found"}, status_code=404)
+
+    # Get role template for system prompt and skills
+    role_config = {}
+    if _role_manager:
+        role = _role_manager.get_role(role_id)
+        if role:
+            role_config = {
+                "system_prompt": role.system_prompt,
+                "skills": role.skills,
+                "tools": role.tools,
+                "autonomy_level": role.autonomy_level,
+                "mcp_servers": role.mcp_servers,
+            }
+
+    llm_config = {"model": model} if model else {}
+    llm_config.update(role_config)
+
+    if registry.assign_role(worker_id, role_id, llm_config):
+        log_activity("role_assigned", f"Assigned {role_id} to {agent.name}", agent.name)
+        return JSONResponse({"status": "assigned", "role_id": role_id, "model": model})
+    return JSONResponse({"error": "Assignment failed"}, status_code=500)
+
+
+# ---- Roles (Phase 2) ----
+
+
+async def handle_list_roles(request: Request) -> JSONResponse:
+    """GET /api/roles — List all role templates."""
+    if not _role_manager:
+        return JSONResponse([])
+    roles = _role_manager.get_all_roles()
+    return JSONResponse([r.to_dict() for r in roles])
+
+
 # ---- Chat ----
 
 
@@ -67,6 +195,7 @@ async def handle_chat_send(request: Request) -> JSONResponse:
     """POST /api/chat/send — Send message to orchestrator."""
     body = await request.json()
     message = body.get("message", "")
+    project_id = body.get("project_id", "")
 
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
@@ -75,8 +204,9 @@ async def handle_chat_send(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Orchestrator not initialized"}, status_code=503)
 
     try:
-        plan = await _orchestrator.handle_user_request(message)
+        plan = await _orchestrator.handle_user_request(message, project_id=project_id)
         result = await _orchestrator.execute_plan(plan)
+        log_activity("plan_completed", f"Plan {result.plan_id}: {message[:80]}")
         return JSONResponse({
             "plan_id": result.plan_id,
             "status": result.status,
@@ -136,6 +266,321 @@ async def handle_approval_history(request: Request) -> JSONResponse:
     return JSONResponse(_intent_queue.get_history())
 
 
+# ---- Channels (Phase 3) ----
+
+
+async def handle_list_channels(request: Request) -> JSONResponse:
+    """GET /api/channels — List conversation channels."""
+    if not _channel_manager:
+        return JSONResponse([])
+    channels = _channel_manager.get_all_channels()
+    return JSONResponse([ch.to_dict() for ch in channels])
+
+
+async def handle_channel_messages(request: Request) -> JSONResponse:
+    """GET /api/channels/{id}/messages — Get channel messages."""
+    channel_id = request.path_params["id"]
+    if not _channel_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    channel = _channel_manager.get_channel(channel_id)
+    if not channel:
+        return JSONResponse({"error": "Channel not found"}, status_code=404)
+    return JSONResponse(channel.to_dict_full())
+
+
+# ---- MCP Servers (Phase 4) ----
+
+
+async def handle_list_mcp_servers(request: Request) -> JSONResponse:
+    """GET /api/mcp/servers — List MCP server configs."""
+    if not _mcp_registry:
+        return JSONResponse([])
+    return JSONResponse([s.to_dict() for s in _mcp_registry.get_all()])
+
+
+async def handle_create_mcp_server(request: Request) -> JSONResponse:
+    """POST /api/mcp/servers — Add MCP server config."""
+    if not _mcp_registry:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    from mesh.mcp.registry import MCPServerConfig
+    config = MCPServerConfig.from_dict(body)
+    result = _mcp_registry.add(config)
+    return JSONResponse(result.to_dict(), status_code=201)
+
+
+async def handle_update_mcp_server(request: Request) -> JSONResponse:
+    """PUT /api/mcp/servers/{id} — Update MCP server config."""
+    server_id = request.path_params["id"]
+    if not _mcp_registry:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    result = _mcp_registry.update(server_id, body)
+    if not result:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse(result.to_dict())
+
+
+async def handle_delete_mcp_server(request: Request) -> JSONResponse:
+    """DELETE /api/mcp/servers/{id} — Delete MCP server config."""
+    server_id = request.path_params["id"]
+    if not _mcp_registry:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    if _mcp_registry.remove(server_id):
+        return JSONResponse({"status": "deleted"})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+async def handle_test_mcp_server(request: Request) -> JSONResponse:
+    """POST /api/mcp/servers/{id}/test — Test MCP server connection."""
+    server_id = request.path_params["id"]
+    if not _mcp_registry:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    config = _mcp_registry.get(server_id)
+    if not config:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    from mesh.mcp.client import MCPToolBridge
+    bridge = MCPToolBridge(config)
+    success = await bridge.connect()
+    tools = bridge.get_tools() if success else []
+    await bridge.disconnect()
+
+    return JSONResponse({
+        "connected": success,
+        "tools_count": len(tools),
+        "tools": [{"name": t["name"], "description": t["description"]} for t in tools],
+    })
+
+
+# ---- Memory (Phase 5) ----
+
+
+async def handle_memory_search(request: Request) -> JSONResponse:
+    """GET /api/memory/search?q=... — Search task memory."""
+    if not _memory_store:
+        return JSONResponse([])
+    query = request.query_params.get("q", "")
+    if not query:
+        return JSONResponse({"error": "q parameter required"}, status_code=400)
+    results = await _memory_store.search_similar(query, limit=10)
+    return JSONResponse(results)
+
+
+async def handle_knowledge_list(request: Request) -> JSONResponse:
+    """GET /api/knowledge — List knowledge entries."""
+    if not _knowledge_base:
+        return JSONResponse([])
+    tag = request.query_params.get("tag")
+    if tag:
+        entries = await _knowledge_base.get_by_tag(tag)
+    else:
+        entries = await _knowledge_base.get_all()
+    return JSONResponse(entries)
+
+
+async def handle_knowledge_create(request: Request) -> JSONResponse:
+    """POST /api/knowledge — Create knowledge entry."""
+    if not _knowledge_base:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    entry_id = await _knowledge_base.add_entry(
+        title=body.get("title", ""),
+        content=body.get("content", ""),
+        tags=body.get("tags", []),
+        source_task_id=body.get("source_task_id", ""),
+    )
+    return JSONResponse({"id": entry_id}, status_code=201)
+
+
+async def handle_knowledge_delete(request: Request) -> JSONResponse:
+    """DELETE /api/knowledge/{id} — Delete knowledge entry."""
+    entry_id = int(request.path_params["id"])
+    if not _knowledge_base:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    if await _knowledge_base.delete_entry(entry_id):
+        return JSONResponse({"status": "deleted"})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+# ---- Projects (Phase 6) ----
+
+
+async def handle_list_projects(request: Request) -> JSONResponse:
+    """GET /api/projects — List projects."""
+    if not _project_manager:
+        return JSONResponse([])
+    projects = await _project_manager.list_projects()
+    return JSONResponse([p.to_dict() for p in projects])
+
+
+async def handle_create_project(request: Request) -> JSONResponse:
+    """POST /api/projects — Create project."""
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    project = await _project_manager.create_project(
+        name=body.get("name", ""),
+        description=body.get("description", ""),
+        config=body.get("config", {}),
+    )
+    return JSONResponse(project.to_dict(), status_code=201)
+
+
+async def handle_update_project(request: Request) -> JSONResponse:
+    """PUT /api/projects/{id} — Update project."""
+    project_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    project = await _project_manager.update_project(project_id, **body)
+    if not project:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse(project.to_dict())
+
+
+async def handle_delete_project(request: Request) -> JSONResponse:
+    """DELETE /api/projects/{id} — Delete project."""
+    project_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    if await _project_manager.delete_project(project_id):
+        return JSONResponse({"status": "deleted"})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+async def handle_list_tasks(request: Request) -> JSONResponse:
+    """GET /api/projects/{id}/tasks — List project tasks."""
+    project_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse([])
+    tasks = await _project_manager.list_tasks(project_id)
+    return JSONResponse([t.to_dict() for t in tasks])
+
+
+async def handle_create_task(request: Request) -> JSONResponse:
+    """POST /api/projects/{id}/tasks — Create task."""
+    project_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    task = await _project_manager.create_task(
+        project_id=project_id,
+        title=body.get("title", ""),
+        description=body.get("description", ""),
+        depends_on=body.get("depends_on", []),
+        priority=body.get("priority", 0),
+        parent_task_id=body.get("parent_task_id", ""),
+    )
+    return JSONResponse(task.to_dict(), status_code=201)
+
+
+async def handle_update_task(request: Request) -> JSONResponse:
+    """PUT /api/tasks/{id} — Update task."""
+    task_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    task = await _project_manager.update_task(task_id, **body)
+    if not task:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse(task.to_dict())
+
+
+async def handle_delete_task(request: Request) -> JSONResponse:
+    """DELETE /api/tasks/{id} — Delete task."""
+    task_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    if await _project_manager.delete_task(task_id):
+        return JSONResponse({"status": "deleted"})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+# ---- Routines (Phase 6) ----
+
+
+async def handle_list_routines(request: Request) -> JSONResponse:
+    """GET /api/routines — List routines."""
+    if not _project_manager:
+        return JSONResponse([])
+    routines = await _project_manager.list_routines()
+    return JSONResponse([r.to_dict() for r in routines])
+
+
+async def handle_create_routine(request: Request) -> JSONResponse:
+    """POST /api/routines — Create routine."""
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    body = await request.json()
+    routine = await _project_manager.create_routine(
+        name=body.get("name", ""),
+        schedule=body.get("schedule", ""),
+        task_template=body.get("task_template", {}),
+        project_id=body.get("project_id", ""),
+        enabled=body.get("enabled", True),
+    )
+    return JSONResponse(routine.to_dict(), status_code=201)
+
+
+async def handle_delete_routine(request: Request) -> JSONResponse:
+    """DELETE /api/routines/{id} — Delete routine."""
+    routine_id = request.path_params["id"]
+    if not _project_manager:
+        return JSONResponse({"error": "Not available"}, status_code=503)
+    if await _project_manager.delete_routine(routine_id):
+        return JSONResponse({"status": "deleted"})
+    return JSONResponse({"error": "Not found"}, status_code=404)
+
+
+# ---- Activity & Metrics (Phase 7) ----
+
+
+async def handle_activity(request: Request) -> JSONResponse:
+    """GET /api/activity — Recent activity log."""
+    limit = int(request.query_params.get("limit", "50"))
+    return JSONResponse(_activity_log[-limit:])
+
+
+async def handle_metrics(request: Request) -> JSONResponse:
+    """GET /api/metrics — System metrics."""
+    registry = get_registry()
+    agents = registry.get_all_agents()
+    healthy = [a for a in agents if a.healthy]
+    workers = [a for a in agents if a.role == "slave"]
+
+    return JSONResponse({
+        "agents": {"total": len(agents), "healthy": len(healthy), "workers": len(workers)},
+        "plans": {"active": len(_orchestrator.active_plans) if _orchestrator else 0},
+        "tunnel": {
+            "active": _tunnel_manager.active if _tunnel_manager else False,
+            "url": _tunnel_manager.url if _tunnel_manager else "",
+            "provider": _tunnel_manager.provider if _tunnel_manager else "",
+        },
+    })
+
+
+# ---- Auth (Phase 8) ----
+
+
+async def handle_token_exchange(request: Request) -> JSONResponse:
+    """POST /api/auth/token — Exchange API key for JWT."""
+    body = await request.json()
+    api_key = body.get("api_key", "")
+
+    if not api_key:
+        return JSONResponse({"error": "api_key required"}, status_code=400)
+
+    try:
+        from mesh.security.jwt_handler import create_token
+        token = create_token(subject="api_user")
+        if token:
+            return JSONResponse({"token": token, "type": "Bearer"})
+        return JSONResponse({"error": "JWT not configured"}, status_code=503)
+    except ImportError:
+        return JSONResponse({"error": "JWT not available"}, status_code=503)
+
+
 # ---- Settings ----
 
 
@@ -148,262 +593,85 @@ async def handle_get_settings(request: Request) -> JSONResponse:
     })
 
 
+async def handle_update_settings(request: Request) -> JSONResponse:
+    """PUT /api/settings — Update settings."""
+    body = await request.json()
+    # For now, log the update
+    logger.info(f"Settings update: {body}")
+    return JSONResponse({"status": "updated"})
+
+
+# ---- Health ----
+
+
+async def handle_health(request: Request) -> JSONResponse:
+    """GET /health — Health check endpoint."""
+    return JSONResponse({"status": "ok"})
+
+
 def create_ui_routes() -> Router:
     """Create Starlette routes for the UI API."""
-    return Router(
-        routes=[
-            # Dashboard
-            Route("/", handle_dashboard, methods=["GET"]),
-            Route("/api/cluster/status", handle_cluster_status, methods=["GET"]),
-            Route("/api/agents", handle_agents, methods=["GET"]),
-            Route("/api/agents/{agent_id}", handle_agent_detail, methods=["GET"]),
-            # Chat
-            Route("/api/chat/send", handle_chat_send, methods=["POST"]),
-            # Approvals
-            Route("/api/approvals/pending", handle_pending_approvals, methods=["GET"]),
-            Route(
-                "/api/approvals/{intent_id}/approve",
-                handle_approve_intent,
-                methods=["POST"],
-            ),
-            Route(
-                "/api/approvals/{intent_id}/reject",
-                handle_reject_intent,
-                methods=["POST"],
-            ),
-            Route("/api/approvals/history", handle_approval_history, methods=["GET"]),
-            # Settings
-            Route("/api/settings", handle_get_settings, methods=["GET"]),
-        ]
-    )
+    routes = [
+        # Dashboard
+        Route("/", handle_dashboard, methods=["GET"]),
+        Route("/health", handle_health, methods=["GET"]),
+        # Cluster
+        Route("/api/cluster/status", handle_cluster_status, methods=["GET"]),
+        Route("/api/agents", handle_agents, methods=["GET"]),
+        Route("/api/agents/{agent_id}", handle_agent_detail, methods=["GET"]),
+        # Workers (Phase 2)
+        Route("/api/workers", handle_workers, methods=["GET"]),
+        Route("/api/workers/{id}/assign", handle_assign_worker, methods=["POST"]),
+        # Roles (Phase 2)
+        Route("/api/roles", handle_list_roles, methods=["GET"]),
+        # Chat
+        Route("/api/chat/send", handle_chat_send, methods=["POST"]),
+        # Approvals
+        Route("/api/approvals/pending", handle_pending_approvals, methods=["GET"]),
+        Route("/api/approvals/{intent_id}/approve", handle_approve_intent, methods=["POST"]),
+        Route("/api/approvals/{intent_id}/reject", handle_reject_intent, methods=["POST"]),
+        Route("/api/approvals/history", handle_approval_history, methods=["GET"]),
+        # Channels (Phase 3)
+        Route("/api/channels", handle_list_channels, methods=["GET"]),
+        Route("/api/channels/{id}/messages", handle_channel_messages, methods=["GET"]),
+        # MCP (Phase 4)
+        Route("/api/mcp/servers", handle_list_mcp_servers, methods=["GET"]),
+        Route("/api/mcp/servers", handle_create_mcp_server, methods=["POST"]),
+        Route("/api/mcp/servers/{id}", handle_update_mcp_server, methods=["PUT"]),
+        Route("/api/mcp/servers/{id}", handle_delete_mcp_server, methods=["DELETE"]),
+        Route("/api/mcp/servers/{id}/test", handle_test_mcp_server, methods=["POST"]),
+        # Memory (Phase 5)
+        Route("/api/memory/search", handle_memory_search, methods=["GET"]),
+        Route("/api/knowledge", handle_knowledge_list, methods=["GET"]),
+        Route("/api/knowledge", handle_knowledge_create, methods=["POST"]),
+        Route("/api/knowledge/{id}", handle_knowledge_delete, methods=["DELETE"]),
+        # Projects (Phase 6)
+        Route("/api/projects", handle_list_projects, methods=["GET"]),
+        Route("/api/projects", handle_create_project, methods=["POST"]),
+        Route("/api/projects/{id}", handle_update_project, methods=["PUT"]),
+        Route("/api/projects/{id}", handle_delete_project, methods=["DELETE"]),
+        Route("/api/projects/{id}/tasks", handle_list_tasks, methods=["GET"]),
+        Route("/api/projects/{id}/tasks", handle_create_task, methods=["POST"]),
+        Route("/api/tasks/{id}", handle_update_task, methods=["PUT"]),
+        Route("/api/tasks/{id}", handle_delete_task, methods=["DELETE"]),
+        # Routines (Phase 6)
+        Route("/api/routines", handle_list_routines, methods=["GET"]),
+        Route("/api/routines", handle_create_routine, methods=["POST"]),
+        Route("/api/routines/{id}", handle_delete_routine, methods=["DELETE"]),
+        # Activity & Metrics (Phase 7)
+        Route("/api/activity", handle_activity, methods=["GET"]),
+        Route("/api/metrics", handle_metrics, methods=["GET"]),
+        # Auth (Phase 8)
+        Route("/api/auth/token", handle_token_exchange, methods=["POST"]),
+        # Settings
+        Route("/api/settings", handle_get_settings, methods=["GET"]),
+        Route("/api/settings", handle_update_settings, methods=["PUT"]),
+    ]
 
+    # Mount static files if directory exists
+    if STATIC_DIR.exists():
+        routes.append(
+            Mount("/static", app=StaticFiles(directory=str(STATIC_DIR)), name="static")
+        )
 
-# ---- Embedded Dashboard HTML ----
-# Minimal SPA that calls the API. Replace with full React build in production.
-
-DASHBOARD_HTML = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>A2A Mesh Dashboard</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        header { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid #334155; margin-bottom: 24px; }
-        header h1 { font-size: 1.5rem; color: #38bdf8; }
-        .status-badge { padding: 4px 12px; border-radius: 9999px; font-size: 0.875rem; }
-        .status-online { background: #064e3b; color: #6ee7b7; }
-        .status-offline { background: #7f1d1d; color: #fca5a5; }
-        .tabs { display: flex; gap: 8px; margin-bottom: 24px; }
-        .tab { padding: 8px 16px; border-radius: 8px; cursor: pointer; background: #1e293b; border: 1px solid #334155; color: #94a3b8; }
-        .tab.active { background: #38bdf8; color: #0f172a; border-color: #38bdf8; }
-        .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
-        .agent-card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; }
-        .agent-card h3 { color: #38bdf8; margin-bottom: 8px; }
-        .agent-card .meta { font-size: 0.875rem; color: #94a3b8; }
-        .agent-card .skills { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px; }
-        .skill-tag { padding: 2px 8px; border-radius: 4px; background: #334155; font-size: 0.75rem; color: #cbd5e1; }
-        .chat-container { display: flex; flex-direction: column; height: calc(100vh - 200px); }
-        .chat-messages { flex: 1; overflow-y: auto; padding: 16px 0; }
-        .chat-message { margin-bottom: 12px; padding: 12px; border-radius: 8px; }
-        .chat-message.user { background: #1e3a5f; margin-left: 20%; }
-        .chat-message.agent { background: #1e293b; margin-right: 20%; }
-        .chat-input { display: flex; gap: 8px; padding: 16px 0; }
-        .chat-input input { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 1rem; }
-        .chat-input button { padding: 12px 24px; border-radius: 8px; background: #38bdf8; color: #0f172a; border: none; font-weight: 600; cursor: pointer; }
-        .chat-input button:hover { background: #7dd3fc; }
-        .approval-card { background: #1e293b; border: 1px solid #f59e0b; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
-        .approval-actions { display: flex; gap: 8px; margin-top: 12px; }
-        .btn-approve { padding: 8px 16px; border-radius: 8px; background: #059669; color: white; border: none; cursor: pointer; }
-        .btn-reject { padding: 8px 16px; border-radius: 8px; background: #dc2626; color: white; border: none; cursor: pointer; }
-        .loading { text-align: center; padding: 40px; color: #64748b; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>A2A Mesh Dashboard</h1>
-            <div id="cluster-status" class="status-badge status-online">Loading...</div>
-        </header>
-
-        <div class="tabs">
-            <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
-            <div class="tab" onclick="showTab('chat')">Chat</div>
-            <div class="tab" onclick="showTab('approvals')">Approvals</div>
-        </div>
-
-        <div id="dashboard-tab">
-            <div id="agent-grid" class="agent-grid">
-                <div class="loading">Loading agents...</div>
-            </div>
-        </div>
-
-        <div id="chat-tab" style="display:none">
-            <div class="chat-container">
-                <div id="chat-messages" class="chat-messages"></div>
-                <div class="chat-input">
-                    <input type="text" id="chat-input" placeholder="Send a task to the mesh..." onkeypress="if(event.key==='Enter')sendChat()">
-                    <button onclick="sendChat()">Send</button>
-                </div>
-            </div>
-        </div>
-
-        <div id="approvals-tab" style="display:none">
-            <div id="approvals-list">
-                <div class="loading">Loading approvals...</div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let currentTab = 'dashboard';
-
-        function showTab(tab) {
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('[id$="-tab"]').forEach(t => t.style.display = 'none');
-            event.target.classList.add('active');
-            document.getElementById(tab + '-tab').style.display = 'block';
-            currentTab = tab;
-            if (tab === 'dashboard') loadAgents();
-            if (tab === 'approvals') loadApprovals();
-        }
-
-        async function loadAgents() {
-            try {
-                const resp = await fetch('/api/agents');
-                const agents = await resp.json();
-                const grid = document.getElementById('agent-grid');
-                if (agents.length === 0) {
-                    grid.innerHTML = '<div class="loading">No agents registered yet.</div>';
-                    return;
-                }
-                grid.innerHTML = agents.map(a => `
-                    <div class="agent-card">
-                        <h3>${a.role === 'master' ? '★ ' : ''}${a.name}</h3>
-                        <div class="meta">
-                            <span class="status-badge ${a.healthy ? 'status-online' : 'status-offline'}">
-                                ${a.healthy ? '● Online' : '● Offline'}
-                            </span>
-                        </div>
-                        <div class="meta" style="margin-top:8px">
-                            LLM: ${a.llm_model || 'N/A'}<br>
-                            ${a.url || a.host + ':' + a.port}
-                        </div>
-                        <div class="skills">
-                            ${(a.skill_tags || []).map(s => `<span class="skill-tag">${s}</span>`).join('')}
-                        </div>
-                    </div>
-                `).join('');
-            } catch (e) {
-                document.getElementById('agent-grid').innerHTML = '<div class="loading">Error loading agents</div>';
-            }
-        }
-
-        async function loadClusterStatus() {
-            try {
-                const resp = await fetch('/api/cluster/status');
-                const data = await resp.json();
-                document.getElementById('cluster-status').textContent =
-                    `● ${data.healthy_agents}/${data.total_agents} agents online`;
-                document.getElementById('cluster-status').className =
-                    'status-badge ' + (data.healthy_agents > 0 ? 'status-online' : 'status-offline');
-            } catch (e) {
-                document.getElementById('cluster-status').textContent = '● Disconnected';
-                document.getElementById('cluster-status').className = 'status-badge status-offline';
-            }
-        }
-
-        async function sendChat() {
-            const input = document.getElementById('chat-input');
-            const message = input.value.trim();
-            if (!message) return;
-
-            const messages = document.getElementById('chat-messages');
-            messages.innerHTML += `<div class="chat-message user">${message}</div>`;
-            input.value = '';
-
-            try {
-                messages.innerHTML += `<div class="chat-message agent" id="thinking">Thinking...</div>`;
-                const resp = await fetch('/api/chat/send', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({message})
-                });
-                const data = await resp.json();
-                document.getElementById('thinking').remove();
-
-                if (data.error) {
-                    messages.innerHTML += `<div class="chat-message agent">Error: ${data.error}</div>`;
-                } else {
-                    let html = `<div class="chat-message agent"><strong>Plan (${data.status}):</strong><br>`;
-                    for (const step of data.steps || []) {
-                        const icon = step.status === 'completed' ? '✅' : step.status === 'failed' ? '❌' : '⏳';
-                        html += `${icon} Step ${step.step}: ${step.description}`;
-                        if (step.agent) html += ` → ${step.agent}`;
-                        html += '<br>';
-                    }
-                    html += '</div>';
-                    messages.innerHTML += html;
-                }
-            } catch (e) {
-                document.getElementById('thinking')?.remove();
-                messages.innerHTML += `<div class="chat-message agent">Error: ${e.message}</div>`;
-            }
-            messages.scrollTop = messages.scrollHeight;
-        }
-
-        async function loadApprovals() {
-            try {
-                const resp = await fetch('/api/approvals/pending');
-                const pending = await resp.json();
-                const list = document.getElementById('approvals-list');
-                if (pending.length === 0) {
-                    list.innerHTML = '<div class="loading">No pending approvals.</div>';
-                    return;
-                }
-                list.innerHTML = pending.map(i => `
-                    <div class="approval-card">
-                        <strong>${i.agent_name}</strong> → ${i.action}<br>
-                        <div class="meta" style="margin-top:4px">${i.description}</div>
-                        <div class="meta">Risk: ${i.risk_level}</div>
-                        <div class="approval-actions">
-                            <button class="btn-approve" onclick="approveIntent('${i.intent_id}')">✅ Approve</button>
-                            <button class="btn-reject" onclick="rejectIntent('${i.intent_id}')">❌ Reject</button>
-                        </div>
-                    </div>
-                `).join('');
-            } catch (e) {
-                document.getElementById('approvals-list').innerHTML = '<div class="loading">Error loading approvals</div>';
-            }
-        }
-
-        async function approveIntent(id) {
-            await fetch(`/api/approvals/${id}/approve`, {method: 'POST'});
-            loadApprovals();
-        }
-
-        async function rejectIntent(id) {
-            await fetch(`/api/approvals/${id}/reject`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({reason: 'Rejected by user'})
-            });
-            loadApprovals();
-        }
-
-        // Initial load
-        loadAgents();
-        loadClusterStatus();
-        // Auto-refresh
-        setInterval(() => {
-            loadClusterStatus();
-            if (currentTab === 'dashboard') loadAgents();
-            if (currentTab === 'approvals') loadApprovals();
-        }, 5000);
-    </script>
-</body>
-</html>
-"""
+    return Router(routes=routes)

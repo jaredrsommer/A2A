@@ -87,6 +87,9 @@ class MasterOrchestrator:
         llm: LLMClient,
         registry: AgentRegistry,
         policy: ApprovalPolicy | None = None,
+        memory_store=None,
+        channel_manager=None,
+        project_manager=None,
     ):
         self.llm = llm
         self.registry = registry
@@ -94,12 +97,16 @@ class MasterOrchestrator:
         self.policy = policy or ApprovalPolicy()
         self.intent_queue = IntentQueue()
         self.active_plans: dict[str, TaskPlan] = {}
+        self.memory_store = memory_store
+        self.channel_manager = channel_manager
+        self.project_manager = project_manager
 
-    async def handle_user_request(self, message: str) -> TaskPlan:
+    async def handle_user_request(self, message: str, project_id: str = "") -> TaskPlan:
         """Process a user request: decompose, assign, and start execution.
 
         Args:
             message: The user's natural language request.
+            project_id: Optional project to associate tasks with.
 
         Returns:
             A TaskPlan with assigned steps.
@@ -122,6 +129,35 @@ class MasterOrchestrator:
             else:
                 logger.warning(f"No agent for step {step.step}: {step.description}")
 
+        # Create lateral communication channels for agents on related steps
+        if self.channel_manager:
+            agent_ids = [s.agent.node_id for s in plan.steps if s.agent]
+            if len(agent_ids) >= 2:
+                self.channel_manager.create_channel(
+                    task_id=plan.plan_id,
+                    participants=agent_ids,
+                    name=f"plan-{plan.plan_id[:8]}",
+                )
+
+        # Create project tasks if project_manager available
+        if self.project_manager and project_id:
+            for step in plan.steps:
+                try:
+                    task = await self.project_manager.create_task(
+                        project_id=project_id,
+                        title=step.description[:100],
+                        description=step.description,
+                        depends_on=[str(d) for d in step.depends_on],
+                        priority=len(plan.steps) - step.step,
+                    )
+                    await self.project_manager.update_task(
+                        task.id,
+                        status="todo",
+                        assigned_agent=step.agent.node_id if step.agent else "",
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create project task: {e}")
+
         plan.status = "executing"
         return plan
 
@@ -132,9 +168,21 @@ class MasterOrchestrator:
             f"- {a.name}: skills={a.skill_tags}" for a in agents
         )
 
+        # Include memory context if available
+        memory_context = ""
+        if self.memory_store:
+            try:
+                similar = await self.memory_store.search_similar(message, limit=3)
+                if similar:
+                    memory_context = "\n\nRelevant past work:\n" + "\n".join(
+                        f"- {s['input'][:100]} → {s['output'][:100]}" for s in similar
+                    )
+            except Exception:
+                pass
+
         prompt = f"""Available agents:
 {agent_summary}
-
+{memory_context}
 User request: {message}"""
 
         response = await self.llm.chat([
@@ -248,6 +296,20 @@ User request: {message}"""
                 data = resp.json()
                 step.status = "completed"
                 step.result = json.dumps(data.get("result", {}))
+
+                # Save to memory
+                if self.memory_store:
+                    try:
+                        await self.memory_store.save_task_result(
+                            task_id=str(step.step),
+                            agent_id=step.agent.node_id,
+                            agent_name=step.agent.name,
+                            input_text=step.description,
+                            output_text=step.result or "",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Memory save failed: {e}")
+
                 return step.result
 
         except Exception as e:

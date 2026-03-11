@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A2A Mesh Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1><span>A2A</span> Mesh Dashboard</h1>
+      <span id="ws-status">Disconnected</span>
+    </header>
+
+    <nav class="tab-bar">
+      <button class="tab-btn active" data-tab="overview">Overview</button>
+      <button class="tab-btn" data-tab="workers">Workers</button>
+      <button class="tab-btn" data-tab="projects">Projects</button>
+      <button class="tab-btn" data-tab="live-feed">Live Feed</button>
+      <button class="tab-btn" data-tab="conversations">Conversations</button>
+      <button class="tab-btn" data-tab="approvals">Approvals</button>
+      <button class="tab-btn" data-tab="mcp-servers">MCP Servers</button>
+      <button class="tab-btn" data-tab="settings">Settings</button>
+    </nav>
+
+    <div id="tab-overview" class="tab-panel active"></div>
+    <div id="tab-workers" class="tab-panel"></div>
+    <div id="tab-projects" class="tab-panel"></div>
+    <div id="tab-live-feed" class="tab-panel"></div>
+    <div id="tab-conversations" class="tab-panel"></div>
+    <div id="tab-approvals" class="tab-panel"></div>
+    <div id="tab-mcp-servers" class="tab-panel"></div>
+    <div id="tab-settings" class="tab-panel"></div>
+  </div>
+
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

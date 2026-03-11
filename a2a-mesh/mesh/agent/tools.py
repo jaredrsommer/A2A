@@ -83,6 +83,12 @@ class ToolRegistry:
             logger.error(f"Tool {name} failed: {e}")
             return f"Tool error: {e}"
 
+    def merge(self, other: ToolRegistry) -> None:
+        """Merge tools from another registry into this one."""
+        for name, tool_def in other._tools.items():
+            if name not in self._tools:
+                self._tools[name] = tool_def
+
     @property
     def names(self) -> list[str]:
         return list(self._tools.keys())

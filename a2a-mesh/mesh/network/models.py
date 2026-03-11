@@ -24,6 +24,10 @@ class NodeInfo:
     registered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     skill_tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Phase 1: Hardware info and role assignment
+    hardware: dict[str, Any] | None = None
+    assigned_role: str = ""
+    config_version: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -39,6 +43,9 @@ class NodeInfo:
             "last_heartbeat": self.last_heartbeat.isoformat(),
             "registered_at": self.registered_at.isoformat(),
             "skill_tags": self.skill_tags,
+            "hardware": self.hardware,
+            "assigned_role": self.assigned_role,
+            "config_version": self.config_version,
         }
 
 

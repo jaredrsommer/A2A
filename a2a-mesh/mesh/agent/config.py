@@ -105,6 +105,25 @@ class IntegrationConfig:
 
 
 @dataclass
+class AuthConfig:
+    """Authentication configuration."""
+
+    api_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SecurityConfig:
+    """Security configuration."""
+
+    jwt_secret: str = ""
+    ssl_cert: str = ""
+    ssl_key: str = ""
+    tunnel: bool = False
+    rate_limit: int = 60
+    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+
+
+@dataclass
 class AgentConfig:
     """Complete agent configuration loaded from YAML."""
 
@@ -118,6 +137,8 @@ class AgentConfig:
     fileshare: FileShareConfig = field(default_factory=FileShareConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     integration: IntegrationConfig = field(default_factory=IntegrationConfig)
+    auth: AuthConfig = field(default_factory=AuthConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> AgentConfig:
@@ -177,6 +198,12 @@ class AgentConfig:
 
         if "integration" in data:
             config.integration = IntegrationConfig(**data["integration"])
+
+        if "auth" in data:
+            config.auth = AuthConfig(**data["auth"])
+
+        if "security" in data:
+            config.security = SecurityConfig(**data["security"])
 
         return config
 

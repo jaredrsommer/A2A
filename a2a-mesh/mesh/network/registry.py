@@ -27,6 +27,8 @@ class AgentRegistry:
         self._agents: dict[str, NodeInfo] = {}
         self._dead_threshold = dead_threshold_seconds
         self._monitor_task: asyncio.Task | None = None
+        # Phase 2: Pushed role configs
+        self._role_configs: dict[str, dict] = {}
 
     def register(self, node_info: NodeInfo) -> str:
         """Register an agent. Returns agent_id."""
@@ -72,6 +74,25 @@ class AgentRegistry:
 
     def find_by_role(self, role: str) -> list[NodeInfo]:
         return [a for a in self._agents.values() if a.role == role and a.healthy]
+
+    def assign_role(self, node_id: str, role_id: str, llm_config: dict) -> bool:
+        """Assign a role to a worker and push config."""
+        agent = self._agents.get(node_id)
+        if not agent:
+            return False
+        agent.assigned_role = role_id
+        agent.config_version += 1
+        self._role_configs[node_id] = {
+            "role_id": role_id,
+            "llm_config": llm_config,
+            "config_version": agent.config_version,
+        }
+        logger.info(f"Registry: Assigned role '{role_id}' to '{agent.name}' ({node_id})")
+        return True
+
+    def get_role_config(self, node_id: str) -> dict | None:
+        """Get the pushed role config for a worker."""
+        return self._role_configs.get(node_id)
 
     async def start_health_monitor(self):
         """Start background task to check for dead agents."""
@@ -120,6 +141,7 @@ async def handle_register(request: Request) -> JSONResponse:
         llm_provider=body.get("llm_provider", ""),
         url=body.get("url", ""),
         skill_tags=body.get("skill_tags", []),
+        hardware=body.get("hardware"),
     )
     agent_id = _registry.register(node_info)
     return JSONResponse({"agent_id": agent_id, "status": "registered"})
@@ -176,6 +198,30 @@ async def handle_cluster_status(request: Request) -> JSONResponse:
     })
 
 
+async def handle_get_agent_config(request: Request) -> JSONResponse:
+    """GET /registry/agents/{agent_id}/config — Get pushed role config."""
+    agent_id = request.path_params["agent_id"]
+    config = _registry.get_role_config(agent_id)
+    if not config:
+        return JSONResponse({"status": "no_config", "config_version": 0})
+    return JSONResponse(config)
+
+
+async def handle_assign_role(request: Request) -> JSONResponse:
+    """PUT /registry/agents/{agent_id}/role — Assign a role to a worker."""
+    agent_id = request.path_params["agent_id"]
+    body = await request.json()
+    role_id = body.get("role_id", "")
+    llm_config = body.get("llm_config", {})
+
+    if not role_id:
+        return JSONResponse({"error": "role_id required"}, status_code=400)
+
+    if _registry.assign_role(agent_id, role_id, llm_config):
+        return JSONResponse({"status": "assigned", "role_id": role_id})
+    return JSONResponse({"error": "Agent not found"}, status_code=404)
+
+
 def create_registry_routes() -> Router:
     """Create Starlette routes for the agent registry API."""
     return Router(
@@ -188,6 +234,16 @@ def create_registry_routes() -> Router:
                 "/registry/agents/{agent_id}/heartbeat",
                 handle_heartbeat,
                 methods=["POST"],
+            ),
+            Route(
+                "/registry/agents/{agent_id}/config",
+                handle_get_agent_config,
+                methods=["GET"],
+            ),
+            Route(
+                "/registry/agents/{agent_id}/role",
+                handle_assign_role,
+                methods=["PUT"],
             ),
             Route("/registry/status", handle_cluster_status, methods=["GET"]),
         ]
